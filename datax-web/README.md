@@ -1,3 +1,5 @@
+
+
 # Datax
 
 
@@ -26,6 +28,12 @@
 ​    DataX 是阿里巴巴集团内被广泛使用的离线数据同步工具/平台，实现包括  MySQL、Oracle、SqlServer、Postgre、HDFS、Hive、ADS、HBase、TableStore(OTS)、MaxCompute(ODPS)、DRDS 等各种异构数据源之间高效的数据同步功能。
 
 ​    DataX在阿里巴巴集团内承担了所有大数据的离线同步业务，并已持续稳定运行了6年之久。目前每天完成同步8w多道作业，每日传输数据量超过300TB。
+
+
+
+
+
+todo: 补充启动方式，配置说明
 
 ## 三、DataX原理
 
@@ -321,7 +329,7 @@ public void start() {
                 this.schedule();                                         /*schedule首先完成的工作是把上一步                                                                              reader和writer split的结果整合到                                                                            具体taskGroupContainer中,同时不                                                                            同的执行模式调用不同的调度策略，将所                                                                            有任务调度起来
                                                                         */
                 LOG.debug("jobContainer starts to do post ...");
-                this.post();                                             /*任务完成后通知*/
+                this.post();                                             /*任务完成后通知任务汇报*/
 
                 LOG.debug("jobContainer starts to do postHandle ...");
                 this.postHandle();                                       /*任务完成后处理*/
@@ -336,7 +344,7 @@ public void start() {
        
             if(!isDryRun) {
 
-                this.destroy();                                         /*销毁，并打印统计信息*/
+                this.destroy();                                         /*销毁、打印统计信息*/
                 this.endTimeStamp = System.currentTimeMillis();
                 if (!hasException) {
                     //最后打印cpu的平均消耗，GC的统计
@@ -354,6 +362,447 @@ public void start() {
     }
 ```
 
+3.reader插件
+
+所有的reader插件都继承于一个Reader抽象类，每个Reader插件在其内部内部实现Job、Task两个内部类
+
+```
+public abstract class Reader extends BaseObject {
+
+	/**
+	 * 每个Reader插件必须实现Job内部类。
+	 * 
+	 * */
+	public static abstract class Job extends AbstractJobPlugin {
+
+		/**
+		 * 切分任务
+		 * 
+		 * @param adviceNumber
+		 * 
+		 * 着重说明下，adviceNumber是框架建议插件切分的任务数，插件开发人员最好切分出来的任务数>=adviceNumber。
+		 *
+		 * 之所以采取这个建议是为了给用户最好的实现，例如框架根据计算认为用户数据存储可以支持100个并发连接，并且用户认为需          * 要100个并发。 此时，插件开发人员如果能够根据上述切分规则进行切分并做到>=100连接信息，DataX就可以同时启动100个          * Channel，这样给用户最好的吞吐量 <br>
+		 * 例如用户同步一张Mysql单表，但是认为可以到10并发吞吐量，插件开发人员最好对该表进行切分，比如使用主键范围切分，
+		 * 并且如果最终切分任务数到>=10，我们就可以提供给用户最大的吞吐量。 <br>
+		 * <br>
+		 * 当然，我们这里只是提供一个建议值，Reader插件可以按照自己规则切分。但是我们更建议按照框架提供的建议值来切分。 <br>
+		 * <br>
+		 * 对于ODPS写入OTS而言，如果存在预排序预切分问题，这样就可能只能按照分区信息切分，无法更细粒度切分，
+		 *  这类情况只能按照源头物理信息切分规则切分。 <br>
+		 * <br>
+		 * */
+		public abstract List<Configuration> split(int adviceNumber);
+	}
+
+	public static abstract class Task extends AbstractTaskPlugin {
+		public abstract void startRead(RecordSender recordSender);
+	}
+}
+```
+
+看一个具体的reader插件：OracleReader插件，OracleReader的Job内部类和Task内部类中的commonRdbmsReaderJob和commonRdbmsReaderTask来自于一个通用的RDBMS类：CommonRdbmsReader，所以主要内容看CommonRdbmsReader.Job和CommonRdbmsReader.Task
+
+Job类
+
+```java
+public static class Job {
+        private static final Logger LOG = LoggerFactory
+                .getLogger(Job.class);
+
+        public Job(DataBaseType dataBaseType) {
+            OriginalConfPretreatmentUtil.DATABASE_TYPE = dataBaseType;
+            SingleTableSplitUtil.DATABASE_TYPE = dataBaseType;
+        }
+
+        public void init(Configuration originalConfig) {
+
+            OriginalConfPretreatmentUtil.doPretreatment(originalConfig);
+
+            LOG.debug("After job init(), job config now is:[\n{}\n]",
+                    originalConfig.toJSON());
+        }
+
+        
+        public void preCheck(Configuration originalConfig,DataBaseType dataBaseType) {
+               /*检查每个表是否有读权限，以及querySql跟splik Key是否正确*/
+            
+            ....其他代码....
+                
+        }
+
+
+        public List<Configuration> split(Configuration originalConfig,
+                                         int adviceNumber) {
+            return ReaderSplitUtil.doSplit(originalConfig, adviceNumber);
+        }
+
+        public void post(Configuration originalConfig) {           /*job主要的功能：对配置文件进行拆分*/
+            // do nothing
+        }
+
+        public void destroy(Configuration originalConfig) {
+            // do nothing
+        }
+
+    }
+```
+
+
+
+Task类：
+
+```java
+public static class Task {
+        private static final Logger LOG = LoggerFactory
+                .getLogger(Task.class);
+        private static final boolean IS_DEBUG = LOG.isDebugEnabled();
+        protected final byte[] EMPTY_CHAR_ARRAY = new byte[0];
+
+        private DataBaseType dataBaseType;
+        private int taskGroupId = -1;
+        private int taskId=-1;
+
+        private String username;
+        private String password;
+        private String jdbcUrl;
+        private String mandatoryEncoding;
+
+        // 作为日志显示信息时，需要附带的通用信息。比如信息所对应的数据库连接等信息，针对哪个表做的操作
+        private String basicMsg;
+
+        public Task(DataBaseType dataBaseType) {
+            this(dataBaseType, -1, -1);
+        }
+
+        public Task(DataBaseType dataBaseType,int taskGropuId, int taskId) {
+            this.dataBaseType = dataBaseType;
+            this.taskGroupId = taskGropuId;
+            this.taskId = taskId;
+        }
+
+        public void init(Configuration readerSliceConfig) {       /*初始化，获取拆分好的配置文件、数据库信等*/
+
+			/* for database connection */
+
+            this.username = readerSliceConfig.getString(Key.USERNAME);
+            this.password = readerSliceConfig.getString(Key.PASSWORD);
+            this.jdbcUrl = readerSliceConfig.getString(Key.JDBC_URL);
+            
+            ....其他代码....
+                
+                
+        }
+      /* startRead方法主要实现了对查询语句的拆分、链接数据库、执行查询、统计任务信息、
+       * 将查询结果的每条记录按照DataX的内部类型发送到startRead
+       * RecordSender是一个中转类,它会吧数据传送给channel通道中,供写插件提取
+      */
+        public void startRead(Configuration readerSliceConfig,
+                              RecordSender recordSender,
+                              TaskPluginCollector taskPluginCollector, int fetchSize) {
+            String querySql = readerSliceConfig.getString(Key.QUERY_SQL);
+            String table = readerSliceConfig.getString(Key.TABLE);
+
+            
+
+            Connection conn = DBUtil.getConnection(this.dataBaseType, jdbcUrl,
+                    username, password);
+
+            ....其他代码....
+            
+
+            int columnNumber = 0;
+            ResultSet rs = null;
+            try {
+            ....其他代码....
+                
+                while (rs.next()) {
+                    rsNextUsedTime += (System.nanoTime() - lastTime);
+                    this.transportOneRecord(recordSender, rs,
+                            metaData, columnNumber, mandatoryEncoding, taskPluginCollector);
+                    lastTime = System.nanoTime();
+                }
+
+               ....其他代码....        
+        }
+
+        public void post(Configuration originalConfig) {
+            // do nothing
+        }
+
+        public void destroy(Configuration originalConfig) {
+            // do nothing
+        }
+        
+               ....其他代码....
+        protected Record buildRecord(RecordSender recordSender,ResultSet rs, ResultSetMetaData metaData, int columnNumber, String mandatoryEncoding,
+        		TaskPluginCollector taskPluginCollector) {
+        	Record record = recordSender.createRecord();
+
+            try {
+                for (int i = 1; i <= columnNumber; i++) {
+                    switch (metaData.getColumnType(i)) {
+
+                    case Types.CHAR:
+                    case Types.NCHAR:
+                    case Types.VARCHAR:
+                    case Types.LONGVARCHAR:
+                    case Types.NVARCHAR:
+                    case Types.LONGNVARCHAR:
+                        String rawData;
+                        if(StringUtils.isBlank(mandatoryEncoding)){
+                            rawData = rs.getString(i);
+                        }else{
+                            rawData = new String((rs.getBytes(i) == null ? EMPTY_CHAR_ARRAY : 
+                                rs.getBytes(i)), mandatoryEncoding);
+                        }
+                        record.addColumn(new StringColumn(rawData));
+                        break;
+
+                    case Types.CLOB:
+                    case Types.NCLOB:
+                        record.addColumn(new StringColumn(rs.getString(i)));
+                        break;
+
+                    case Types.SMALLINT:
+                    case Types.TINYINT:
+                    case Types.INTEGER:
+                    case Types.BIGINT:
+                        record.addColumn(new LongColumn(rs.getString(i)));
+                        break;
+
+                    case Types.NUMERIC:
+                    case Types.DECIMAL:
+                        record.addColumn(new DoubleColumn(rs.getString(i)));
+                        break;
+
+                    case Types.FLOAT:
+                    case Types.REAL:
+                    case Types.DOUBLE:
+                        record.addColumn(new DoubleColumn(rs.getString(i)));
+                        break;
+
+                    case Types.TIME:
+                        record.addColumn(new DateColumn(rs.getTime(i)));
+                        break;
+
+                    // for mysql bug, see http://bugs.mysql.com/bug.php?id=35115
+                    case Types.DATE:
+                        if (metaData.getColumnTypeName(i).equalsIgnoreCase("year")) {
+                            record.addColumn(new LongColumn(rs.getInt(i)));
+                        } else {
+                            record.addColumn(new DateColumn(rs.getDate(i)));
+                        }
+                        break;
+
+                    case Types.TIMESTAMP:
+                        record.addColumn(new DateColumn(rs.getTimestamp(i)));
+                        break;
+
+                    case Types.BINARY:
+                    case Types.VARBINARY:
+                    case Types.BLOB:
+                    case Types.LONGVARBINARY:
+                        record.addColumn(new BytesColumn(rs.getBytes(i)));
+                        break;
+
+                    // warn: bit(1) -> Types.BIT 可使用BoolColumn
+                    // warn: bit(>1) -> Types.VARBINARY 可使用BytesColumn
+                    case Types.BOOLEAN:
+                    case Types.BIT:
+                        record.addColumn(new BoolColumn(rs.getBoolean(i)));
+                        break;
+
+                    case Types.NULL:
+                        String stringData = null;
+                        if(rs.getObject(i) != null) {
+                            stringData = rs.getObject(i).toString();
+                        }
+                        record.addColumn(new StringColumn(stringData));
+                        break;
+
+                    default:
+                        throw DataXException
+                                .asDataXException(
+                                        DBUtilErrorCode.UNSUPPORTED_TYPE,
+                                        String.format(
+                                                "您的配置文件中的列配置信息有误. 因为DataX 不支持数据库读取这种字段类型. 字段名:[%s], 字段名称:[%s], 字段Java类型:[%s]. 请尝试使用数据库函数将其转换datax支持的类型 或者不同步该字段 .",
+                                                metaData.getColumnName(i),
+                                                metaData.getColumnType(i),
+                                                metaData.getColumnClassName(i)));
+                    }
+                }
+            } catch (Exception e) {
+                if (IS_DEBUG) {
+                    LOG.debug("read data " + record.toString()
+                            + " occur exception:", e);
+                }
+                //TODO 这里识别为脏数据靠谱吗？
+                taskPluginCollector.collectDirtyRecord(record, e);
+                if (e instanceof DataXException) {
+                    throw (DataXException) e;
+                }
+            }
+            return record;
+        }
+    }
+```
+
+4. Writer插件
+
+   所有的Writer插件都继承于一个Writer抽象类，每个Writer插件在其内部内部实现Job、Task两个内部类
+
+```java
+public abstract class Writer extends BaseObject {
+   /**
+    * 每个Writer插件必须实现Job内部类
+    */
+   public abstract static class Job extends AbstractJobPlugin {
+      /**
+       * 切分任务。<br>
+       * 
+       * @param mandatoryNumber
+       *            为了做到Reader、Writer任务数对等，这里要求Writer插件必须按照源端的切分数进行切分。否则框架报错！
+       * 
+       * */
+      public abstract List<Configuration> split(int mandatoryNumber);
+   }
+
+   /**
+    * 每个Writer插件必须实现Task内部类
+    */
+   public abstract static class Task extends AbstractTaskPlugin {
+
+      public abstract void startWrite(RecordReceiver lineReceiver);
+
+      public boolean supportFailOver(){return false;}
+   }
+}
+```
+
+
+
+看一个具体的Writer插件：HdfsWriter
+
+Job类：主要实现了job初始化、参数检查、配置文件拆分、创建HDFS临时目录
+
+![](images/HdfsWriter.Job.png)
+
+Task类：主要实现了task初始化、接收拆分后的配置文件、向HDFS中写入TEXT FILE或ORC FILE
+
+![](images/HdfsWriter.Task.png)
+
+
+
+再看任务调度：
+
+schedule首先完成的工作是把上一步reader和writer split的结果整合到具体taskGroupContainer中，同时不同的执行模式调用不同的调度策略，将所有任务调度起来
+
+目前已开源的代码只支持**StandAlone**调度方式，由StandAloneScheduler类实现，StandAloneScheduler类继承ProcessInnerScheduler类，ProcessInnerScheduler类继承AbstractScheduler类，schedule方法在AbstractScheduler中实现。
+
+```java
+public void schedule(List<Configuration> configurations) {
+        Validate.notNull(configurations,
+                "scheduler配置不能为空");                                         /*报告间隔时间*/
+        int jobReportIntervalInMillSec = configurations.get(0).getInt(
+                CoreConstant.DATAX_CORE_CONTAINER_JOB_REPORTINTERVAL, 30000);
+        int jobSleepIntervalInMillSec = configurations.get(0).getInt(
+                CoreConstant.DATAX_CORE_CONTAINER_JOB_SLEEPINTERVAL, 10000);
+
+        this.jobId = configurations.get(0).getLong(
+                CoreConstant.DATAX_CORE_CONTAINER_JOB_ID);
+
+        errorLimit = new ErrorRecordChecker(configurations.get(0));
+
+        /**
+         * 给 taskGroupContainer 的 Communication 注册
+         */
+        this.containerCommunicator.registerCommunication(configurations);
+
+        int totalTasks = calculateTaskCount(configurations);
+        startAllTaskGroup(configurations);
+
+        Communication lastJobContainerCommunication = new Communication();
+
+        long lastReportTimeStamp = System.currentTimeMillis();
+        try {
+            while (true) {                                           /*无限循环(直到同步作业的状态为成功状态)
+                                                                      * 这个无限循环的意义在于同步作业进行的时                                                                       *候,它会以报告周期时间不断的打印进行的状                                                                       *态
+                                                                      */
+                /**
+                 * step 1: collect job stat
+                 * step 2: getReport info, then report it
+                 * step 3: errorLimit do check
+                 * step 4: dealSucceedStat();
+                 * step 5: dealKillingStat();
+                 * step 6: dealFailedStat();
+                 * step 7: refresh last job stat, and then sleep for next while
+                 *
+                 * above steps, some ones should report info to DS
+                 *
+                 */
+                Communication nowJobContainerCommunication = this.containerCommunicator.collect();
+                nowJobContainerCommunication.setTimestamp(System.currentTimeMillis());
+                LOG.debug(nowJobContainerCommunication.toString());
+
+                //汇报周期
+                long now = System.currentTimeMillis();
+                if (now - lastReportTimeStamp > jobReportIntervalInMillSec) {
+                    Communication reportCommunication = CommunicationTool
+                            .getReportCommunication(nowJobContainerCommunication, lastJobContainerCommunication, totalTasks);
+
+                    this.containerCommunicator.report(reportCommunication);
+                    lastReportTimeStamp = now;
+                    lastJobContainerCommunication = nowJobContainerCommunication;
+                }
+
+                errorLimit.checkRecordLimit(nowJobContainerCommunication);
+
+                                                                      /*直到同步作业的状态为成功,退出循环*/
+                
+                if (nowJobContainerCommunication.getState() == State.SUCCEEDED) {
+                    LOG.info("Scheduler accomplished all tasks.");
+                    break;
+                }
+
+                if (isJobKilling(this.getJobId())) {
+                    dealKillingStat(this.containerCommunicator, totalTasks);
+                } else if (nowJobContainerCommunication.getState() == State.FAILED) {
+                    dealFailedStat(this.containerCommunicator, nowJobContainerCommunication.getThrowable());
+                }
+
+                Thread.sleep(jobSleepIntervalInMillSec);
+            }
+        } catch (InterruptedException e) {
+            // 以 failed 状态退出
+            LOG.error("捕获到InterruptedException异常!", e);
+
+            throw DataXException.asDataXException(
+                    FrameworkErrorCode.RUNTIME_ERROR, e);
+        }
+
+    }
+```
+
+startAllTaskGroup方法在ProcessInnerScheduler中实现：
+
+```
+public void startAllTaskGroup(List<Configuration> configurations) {
+    //首先创建一个固定数量的线程池,数量为taskGroup的数量
+    this.taskGroupContainerExecutorService = Executors
+            .newFixedThreadPool(configurations.size());
+    //循环taskGroup配置
+    for (Configuration taskGroupConfiguration : configurations) {
+        //创建taskGroup运行器
+        TaskGroupContainerRunner taskGroupContainerRunner = newTaskGroupContainerRunner(taskGroupConfiguration);
+        //放到线程池中运行
+        this.taskGroupContainerExecutorService.execute(taskGroupContainerRunner);
+    }
+    //关闭线程池
+    this.taskGroupContainerExecutorService.shutdown();
+}
+```
+
 
 
 ## 四、datax-web简介
@@ -366,9 +815,9 @@ public void start() {
 
 需新增功能：
 
-1、datax-web添加数据源时，支持inceptor驱动，原生支持高版本hive
+1、datax-web添加数据源时，支持inceptor驱动，原生只支持高版本hive
 
 2、datax-web添加HDFS数据源
 
-2、考虑将flume集成到datax-web，强化非结构化数据采集功能
+3、
 
